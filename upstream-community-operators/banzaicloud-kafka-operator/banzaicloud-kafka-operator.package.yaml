@@ -1,0 +1,4 @@
+channels:
+- currentCSV: banzaicloud-kafka-operator.0.6.1
+  name: beta
+packageName: banzaicloud-kafka-operator

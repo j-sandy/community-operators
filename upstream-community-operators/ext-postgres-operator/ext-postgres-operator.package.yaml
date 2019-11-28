@@ -1,0 +1,4 @@
+channels:
+- currentCSV: ext-postgres-operator.v0.3.0
+  name: stable
+packageName: ext-postgres-operator

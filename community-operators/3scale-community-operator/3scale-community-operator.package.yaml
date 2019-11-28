@@ -1,0 +1,4 @@
+channels:
+- currentCSV: 3scale-community-operator.v0.3.0
+  name: alpha
+packageName: 3scale-community-operator

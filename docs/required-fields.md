@@ -2,7 +2,7 @@
 
 ## Preparing your CSV for use with OLM
 
-Before you begin, we strongly advise that you follow Operator-Lifecycle-Manager's docs on [building a CSV for the Operator Framework](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/Documentation/design/building-your-csv.md). These outline the functional purpose of the CSV and which fields are required for installing your Operator CSV through OLM.
+Before you begin, we strongly advise that you follow Operator-Lifecycle-Manager's docs on [building a CSV for the Operator Framework](https://github.com/operator-framework/operator-lifecycle-manager/blob/master/doc/design/building-your-csv.md). These outline the functional purpose of the CSV and which fields are required for installing your Operator CSV through OLM.
 
 ## Required fields for OperatorHub
 
@@ -42,6 +42,10 @@ spec:
   - 'These are used when searching for operators in the UI'
 ```
 
+### Logo requirements
+
+The logo for your Operator is inlined into the CSV as a base64-encoded string. The height:width ratio should be 1:2. The maximum dimensions are 80px for width and 40px in height.
+
 ### Categories
 
 For the best user experience, choose from the following categories:
@@ -49,18 +53,19 @@ For the best user experience, choose from the following categories:
 | Category  |
 |-----------|
 | AI/Machine Learning |
+| Application Runtime |
 | Big Data |
-| Security |
-| Networking |
-| Storage |
-| Integration & Delivery |
-| Database |
 | Cloud Provider |
+| Database |
 | Developer Tools |
+| Integration & Delivery |
 | Logging & Tracing |
-| Streaming & Messaging |
 | Monitoring |
+| Networking |
 | OpenShift Optional |
+| Security |
+| Storage |
+| Streaming & Messaging |
 
 If none of these categories fit your operator, please open a PR against this repo to edit this doc and we will work with you to propagate this change to [operator-courier](https://github.com/operator-framework/operator-courier) so that your operator can get through CI tests.
 

@@ -3,13 +3,13 @@
 function wait_on_deployment() {
   local dep="$1"
   local namespace="$2"
-  local retries=20 # 2 minute timeout
+  local retries=30 # 2 minute timeout
 
   while ! kubectl rollout status -w "deployment/${dep}" --namespace=${namespace}; do
       sleep 6
       retries=$((retries - 1))
       if [[ $retries == 0 ]]; then
-        echo "FAIL: Failed to rollout deployloyment \"$dep\""
+        >&2 echo "FAIL: Failed to rollout deployloyment \"$dep\""
         exit 1
       fi
       echo "retrying check rollout status for deployment \"$dep\"..."
@@ -21,15 +21,30 @@ function wait_on_deployment() {
 function check_subscription_passes() {
   local sub="$1"
   local namespace="$2"
-  local retries=10 # 1 minute timeout
+  local packageName="$3"
+  local retries=30 # 1 minute timeout
 
   echo "Checking subscription \"$sub\" reaches \"AtLatestKnown\" state"
   while ! kubectl get "subscription/${sub}" --namespace=${namespace} -o json | jq .status -e &> /dev/null; do
       sleep 6
       retries=$((retries - 1))
       if [[ $retries == 0 ]]; then
-        echo "FAIL: Failed to pick up subscription \"$sub\""
+        >&2 echo "FAIL: Failed to pick up subscription \"$sub\""
         kubectl get "subscription/${sub}" --namespace=${namespace} -o yaml
+        # Check if operator package is accessible on cluster, if not check the operator registry pod and exit
+        if ! kubectl get packagemanifests --namespace=${namespace} | tail -n +2 | grep ${packageName} &> /dev/null; then
+          echo "Package ${packageName} could not be found. Checking operator-registry logs:"
+          kubectl logs $(get_first_matching_pod "$packageName-ocs" "$namespace") --namespace=${namespace}
+          exit 1
+        fi
+        echo "catalog-operator logs:"
+        if [[ "$DISTRO_TYPE" == "$DISTRO_TYPE_OPENSHIFT" ]]; then
+          kubectl logs $(get_first_matching_pod catalog-operator- openshift-operator-lifecycle-manager) --namespace="openshift-operator-lifecycle-manager"
+        else
+          kubectl logs $(get_first_matching_pod catalog-operator- olm) --namespace="olm"
+        fi
+        echo "operator-registry logs:"
+        kubectl logs $(get_first_matching_pod "$packageName-ocs" "$namespace") --namespace=${namespace}
         exit 1
       fi
       echo "retrying check of subscription status for \"$sub\"..."
@@ -40,11 +55,11 @@ function check_subscription_passes() {
       sleep 6
       retries=$((retries - 1))
       if [[ $retries == 0 ]]; then
-        echo "FAIL: Failed to reach "AtLatestKnown" subscription status for \"$sub\""
+        >&2 echo "FAIL: Failed to reach "AtLatestKnown" subscription status for \"$sub\""
         kubectl get "subscription/${sub}" --namespace=${namespace} -o yaml
-        installplan="`kubectl get subscription/packageserver -n olm -o json | jq .status.installplan.name`"
-        echo "  installplan status for \"$installplan\":"
-        kubectl get "installplan/${installplan}" --namespace=${installplan} -o yaml
+        installplan="`kubectl get subscription/${sub} --namespace=${namespace} -o json | jq .status.installplan.name`"
+        >&2 echo "installplan status for \"$installplan\":"
+        kubectl get "installplan/${installplan}" --namespace=${namespace} -o yaml
         exit 1
       fi
       echo "subscription status for \"$sub\": `kubectl get "subscription/${sub}" --namespace=${namespace} -o json | jq .status.state`"
@@ -56,20 +71,42 @@ function check_subscription_passes() {
 function check_csv_passes() {
   local csv="$1"
   local namespace="$2"
-  local retries=10 # 1 minute timeout
+  local installmode="$3"
+  local retries=30 # 1 minute timeout
 
   echo "Check that clusterserviceversion \"$csv\" status is set to \"Succeeded\""
   while ! [[ `kubectl get "clusterserviceversion/${csv}" --namespace=${namespace} -o json | jq .status.phase` == \"Succeeded\" ]]; do
       sleep 6
       retries=$((retries - 1))
       if [[ $retries == 0 ]]; then
-        echo "failed to reach "Succeeded" clusterserviceversion status for \"$csv\""
-        # Print out CSV on error
-        kubectl get "clusterserviceversion/${csv}" --namespace=${namespace} -o yaml
+        >&2 echo "failed to reach "Succeeded" clusterserviceversion status for \"$csv\""
+        # Print out CSV's 'status' section on error
+        kubectl get "clusterserviceversion/${csv}" --namespace=${namespace} -o jsonpath="{.status}"
+        # Check operator pod(s) logs
+        get_operator_logs "$csv" "$namespace"
         exit 1
       fi
       echo "clusterserviceversion phase for \"$csv\": `kubectl get "clusterserviceversion/${csv}" --namespace=${namespace} -o json | jq .status.phase`"
   done
+
+  if [[ "$installmode" == "AllNamespaces" ]]; then
+      echo "Check that clusterserviceversion \"$csv\" in second namespace status is set to \"Succeeded\""
+      local retries=30
+
+      while ! [[ `kubectl get "clusterserviceversion/${csv}" --namespace=operators -o json | jq .status.phase` == \"Succeeded\" ]]; do
+          sleep 6
+          retries=$((retries - 1))
+          if [[ $retries == 0 ]]; then
+            >&2 echo "failed to reach "Succeeded" clusterserviceversion status for \"$csv\" in operators namespace"
+            # Print out CSV's 'status' section on error
+            kubectl get "clusterserviceversion/${csv}" --namespace=operators -o jsonpath="{.status}"
+            # Check operator pod(s) logs
+            get_operator_logs "$csv" "operators"
+            exit 1
+          fi
+          echo "clusterserviceversion phase for \"$csv\": `kubectl get "clusterserviceversion/${csv}" --namespace=operators -o json | jq .status.phase`"
+      done
+  fi
 
   echo "Successfully installed clusterserviceversion \"$csv\" in namespace \"$namespace\""
 }
@@ -118,8 +155,37 @@ function delete_objects_incluster() {
   local namespace="$2"
 
   for f in $(find "$deploy_dir" -maxdepth 1 -name "*.yaml" -print); do
-    kubectl delete --ignore-not-found=true "$(yq r "$f" "kind" | awk '{ print tolower($0) }')" "$(yq r "$f" "metadata.name")" --namespace="$namespace"
+    kubectl delete --ignore-not-found=true "$(yq r "$f" "kind" | awk '{ print tolower($0) }')" "$(yq r "$f" "metadata.name")" --namespace="$namespace" --wait=true
   done
+}
+
+function delete_namespace() {
+    local namespace="$1"
+    local cleanmode="$2"
+    local OK="\033[0;32m"
+    local WARN="\033[0;33m"
+    local NC="\033[0m"
+
+    if [[ "$cleanmode" == "FORCE" ]]; then
+      printf "Deleting namespace %s\t[ ${WARN} Processing ${NC} ]\n" | expand  -t 50 >&2;
+    fi
+    # for sure
+    kubectl delete pod,deployment,subs,pvc,operatorgroup,service,ing -all -n "$namespace"  > /dev/null 2>&1
+    kubectl delete ns "$namespace"  > /dev/null 2>&1
+    if [[ "$cleanmode" == "FORCE" ]]; then
+      printf "Deleting namespace %s\t[ ${OK} OK ${NC} ]\n" | expand  -t 50 >&2
+    fi
+}
+
+function uninstall_olm() {
+    local OK="\033[0;32m"
+    local WARN="\033[0;33m"
+    local NC="\033[0m"
+
+
+    printf "Uninstall olm %s\t[ ${WARN} Processing ${NC} ]\n" | expand  -t 50 >&2;
+    operator-sdk alpha olm uninstall > /dev/null
+    printf "Uninstall olm %s\t[ ${OK} OK ${NC} ]\n" | expand  -t 50 >&2
 }
 
 function log_operator_state() {
@@ -132,12 +198,52 @@ function log_operator_state() {
   for k in "${!objects[@]}"; do
     obj_list="${objects[$k]}"
     for obj in $obj_list; do
-      echo -e "\n${k}: $(echo "$obj" | cut -d' ' -f1)\n" >> "$log_file"
+      >&2 echo -e "\n${k}: $(echo "$obj" | cut -d' ' -f1)\n" >> "$log_file"
       kubectl describe "$k" $obj --namespace="$namespace" >> "$log_file" 2>&1 || true
-      echo -e "\n---\n" >> "$log_file"
+      >&2 echo -e "\n---\n" >> "$log_file"
     done
   done
   kubectl describe pods --namespace="$namespace" >> "$log_file" 2>&1
+}
+
+function get_operator_logs() {
+  local csv="$1"
+  local namespace="$2"
+
+  # Get a list of pods and containers via the CSV
+  declare -a operator_pods
+  declare -A pods_containers
+  local pod_counter=0
+  while read -r deployment; do
+    operator_pods[${pod_counter}]="$(echo "$deployment" | jq -r ".name")"
+    pods_containers["${operator_pods[${pod_counter}]}"]="$(echo "$deployment" | jq '.spec.template.spec.containers' | jq -r '.[].name')"
+    ((++pod_counter))
+  done < <(kubectl get csv "$csv" --namespace="$namespace" -o json | jq -r ".spec.install.spec.deployments" | jq -c '.[]')
+
+  # Print out logs for all pods deployed by the CSV
+  local cluster_pods="$(kubectl get pods --namespace="$namespace" -o=name)"
+  for pod in "${operator_pods[@]}"; do
+    if ! echo "$cluster_pods" | grep "$pod" &> /dev/null; then
+      echo "Pod "$pod" listed in CSV was not found in namespace "$namespace""
+    else
+      for container in `echo ${pods_containers["$pod"]}`; do
+        # Skip scorecard-proxy container since it's not part of the operator
+        if [[ "$container" == "scorecard-proxy" ]]; then
+          continue
+        fi
+        echo "Logs for container "$container" in pod "$pod":"
+        kubectl logs $(get_first_matching_pod "$pod-" "$namespace") -c "$container" --namespace="$namespace"
+        echo ""
+      done
+    fi
+  done
+}
+
+function get_first_matching_pod() {
+  local prefix="$1"
+  local namespace="$2"
+
+  echo "$(kubectl get pods --namespace="$namespace" -o name | awk -v prefix="$prefix" '$1 ~ prefix' | head -n 1)"
 }
 
 function get_op_namespace() {
@@ -153,9 +259,11 @@ function get_op_namespace() {
     echo "operators"
   elif [[ ${modes["SingleNamespace"]} == "true" ]]; then
     echo "$op_name"
+  elif [[ ${modes["OwnNamespace"]} == "true" ]]; then
+    echo "$op_name"
   else
-    # Operators should have at least one of SingleNamespace, AllNamespaces true.
-    echo "Both SingleNamespace and AllNamespaces cannot be false"
+    # Operators should have at least one of SingleNamespace, AllNamespaces, OwnNamespaces true.
+    echo "Operators should have at least one of OwnNamespace, SingleNamespace or  AllNamespaces set to true" 1>&2
     exit 1
   fi
 }
@@ -172,7 +280,7 @@ function get_channel_name() {
   if [[ -n "${channels["$csv_name"]}" ]]; then
     echo ${channels["$csv_name"]}
   else
-    echo "No matching channel exists for this CSV in the package file"
+    echo "No matching channel exists for this CSV in the package file" 1>&2
     exit 1
   fi
 }

@@ -1,0 +1,4 @@
+channels:
+- currentCSV: opendatahub-operator.v0.4.1
+  name: alpha
+packageName: opendatahub-operator
